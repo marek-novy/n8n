@@ -25,9 +25,10 @@ export class MessageEventBusDestinationSyslog
 {
 	client: syslog.Client;
 	private reconnectAttempts = 0;
-	private readonly maxReconnectAttempts = 5;
-	private readonly reconnectDelay = 1000; // 1 second
+	private readonly initialReconnectDelay = 1000; // 1 second initial delay
+	private readonly maxReconnectDelay = 30000; // Maximum 30 second delay
 	private isConnected = false;
+	private isReconnecting = false;
 
 	expectedStatusCode?: number;
 
@@ -81,19 +82,26 @@ export class MessageEventBusDestinationSyslog
 				this.handleReconnect();
 			});
 		}
+		this.isConnected = true;
 	}
 
 	private async handleReconnect() {
-		if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-			Container.get(Logger).error(
-				`Failed to reconnect to syslog server after ${this.maxReconnectAttempts} attempts`,
-			);
+		if (this.isReconnecting) {
+			Container.get(Logger).debug('Reconnection already in progress, skipping duplicate attempt');
 			return;
 		}
 
+		this.isReconnecting = true;
 		this.reconnectAttempts++;
+
+		// Calculate exponential backoff with a maximum delay cap
+		const delay = Math.min(
+			this.initialReconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
+			this.maxReconnectDelay,
+		);
+
 		Container.get(Logger).debug(
-			`Attempting to reconnect to syslog server (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
+			`Attempting to reconnect to syslog server (attempt ${this.reconnectAttempts}, delay: ${delay}ms)`,
 		);
 
 		try {
@@ -101,18 +109,20 @@ export class MessageEventBusDestinationSyslog
 			this.client.close();
 
 			// Wait before reconnecting
-			await new Promise((resolve) => setTimeout(resolve, this.reconnectDelay));
+			await new Promise((resolve) => setTimeout(resolve, delay));
 
 			// Initialize new client
 			this.initializeClient();
 
 			this.isConnected = true;
-			this.reconnectAttempts = 0;
+			this.reconnectAttempts = 0; // Reset attempts counter on success
 			Container.get(Logger).debug('Successfully reconnected to syslog server');
 		} catch (error) {
 			Container.get(Logger).error(`Failed to reconnect to syslog server: ${error.message}`);
-			// Try to reconnect again if we haven't reached max attempts
+			// Try to reconnect again, with increasing delay
 			this.handleReconnect();
+		} finally {
+			this.isReconnecting = false;
 		}
 	}
 
