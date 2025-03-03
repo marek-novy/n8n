@@ -24,6 +24,11 @@ export class MessageEventBusDestinationSyslog
 	implements MessageEventBusDestinationSyslogOptions
 {
 	client: syslog.Client;
+	private reconnectAttempts = 0;
+	private readonly initialReconnectDelay = 1000; // 1 second initial delay
+	private readonly maxReconnectDelay = 30000; // Maximum 30 second delay
+	private isConnected = false;
+	private isReconnecting = false;
 
 	expectedStatusCode?: number;
 
@@ -52,61 +57,129 @@ export class MessageEventBusDestinationSyslog
 		this.eol = options.eol ?? '\n';
 		this.expectedStatusCode = options.expectedStatusCode ?? 200;
 
+		this.initializeClient();
+	}
+
+	private initializeClient() {
 		this.client = syslog.createClient(this.host, {
 			appName: this.app_name,
 			facility: syslog.Facility.Local0,
-			// severity: syslog.Severity.Error,
 			port: this.port,
-			transport:
-				options.protocol !== undefined && options.protocol === 'tcp'
-					? syslog.Transport.Tcp
-					: syslog.Transport.Udp,
+			transport: this.protocol === 'tcp' ? syslog.Transport.Tcp : syslog.Transport.Udp,
 		});
-		this.logger.debug(`MessageEventBusDestinationSyslog with id ${this.getId()} initialized`);
-		this.client.on('error', function (error) {
-			Container.get(Logger).error(`${error.message}`);
+
+		this.client.on('error', (error) => {
+			this.isConnected = false;
+			Container.get(Logger).error(`Syslog client error: ${error.message}`);
+			this.handleReconnect();
 		});
+
+		// For TCP connections, handle close events
+		if (this.protocol === 'tcp') {
+			this.client.on('close', () => {
+				this.isConnected = false;
+				Container.get(Logger).warn('Syslog client connection closed');
+				this.handleReconnect();
+			});
+		}
+		this.isConnected = true;
+	}
+
+	private async handleReconnect() {
+		if (this.isReconnecting) {
+			Container.get(Logger).debug('Reconnection already in progress, skipping duplicate attempt');
+			return;
+		}
+
+		this.isReconnecting = true;
+		this.reconnectAttempts++;
+
+		// Calculate exponential backoff with a maximum delay cap
+		const delay = Math.min(
+			this.initialReconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
+			this.maxReconnectDelay,
+		);
+
+		Container.get(Logger).debug(
+			`Attempting to reconnect to syslog server (attempt ${this.reconnectAttempts}, delay: ${delay}ms)`,
+		);
+
+		try {
+			// Close existing client if it exists
+			this.client.close();
+
+			// Wait before reconnecting
+			await new Promise((resolve) => setTimeout(resolve, delay));
+
+			// Initialize new client
+			this.initializeClient();
+
+			this.isConnected = true;
+			this.reconnectAttempts = 0; // Reset attempts counter on success
+			Container.get(Logger).debug('Successfully reconnected to syslog server');
+		} catch (error) {
+			Container.get(Logger).error(`Failed to reconnect to syslog server: ${error.message}`);
+			// Try to reconnect again, with increasing delay
+			this.handleReconnect();
+		} finally {
+			this.isReconnecting = false;
+		}
 	}
 
 	async receiveFromEventBus(emitterPayload: MessageWithCallback): Promise<boolean> {
 		const { msg, confirmCallback } = emitterPayload;
 		let sendResult = false;
+
 		if (msg.eventName !== eventMessageGenericDestinationTestEvent) {
 			if (!this.license.isLogStreamingEnabled()) return sendResult;
 			if (!this.hasSubscribedToEvent(msg)) return sendResult;
 		}
-		try {
-			const serializedMessage = msg.serialize();
-			if (this.anonymizeAuditMessages) {
-				serializedMessage.payload = msg.anonymize();
+
+		if (!this.isConnected) {
+			this.logger.warn('Syslog client is not connected, message will be dropped');
+			return sendResult;
+		}
+
+		return new Promise((resolve) => {
+			try {
+				const serializedMessage = msg.serialize();
+				if (this.anonymizeAuditMessages) {
+					serializedMessage.payload = msg.anonymize();
+				}
+				delete serializedMessage.__type;
+
+				// Add timeout handling
+				const timeoutId = setTimeout(() => {
+					this.logger.error('Syslog message send timeout');
+					resolve(false);
+				}, 5000); // 5 second timeout
+
+				this.client.log(
+					JSON.stringify(serializedMessage),
+					{
+						severity: msg.eventName.toLowerCase().endsWith('error')
+							? syslog.Severity.Error
+							: syslog.Severity.Debug,
+						msgid: msg.id,
+						timestamp: msg.ts.toJSDate(),
+					},
+					async (error) => {
+						clearTimeout(timeoutId);
+
+						if (error?.message) {
+							this.logger.debug(error.message);
+							resolve(false);
+						} else {
+							confirmCallback(msg, { id: this.id, name: this.label });
+							resolve(true);
+						}
+					},
+				);
+			} catch (error) {
+				if (error.message) this.logger.debug(error.message as string);
+				resolve(false);
 			}
-			delete serializedMessage.__type;
-			this.client.log(
-				JSON.stringify(serializedMessage),
-				{
-					severity: msg.eventName.toLowerCase().endsWith('error')
-						? syslog.Severity.Error
-						: syslog.Severity.Debug,
-					msgid: msg.id,
-					timestamp: msg.ts.toJSDate(),
-				},
-				async (error) => {
-					if (error?.message) {
-						this.logger.debug(error.message);
-					} else {
-						// eventBus.confirmSent(msg, { id: this.id, name: this.label });
-						confirmCallback(msg, { id: this.id, name: this.label });
-						sendResult = true;
-					}
-				},
-			);
-		} catch (error) {
-			if (error.message) this.logger.debug(error.message as string);
-		}
-		if (msg.eventName === eventMessageGenericDestinationTestEvent) {
-			await new Promise((resolve) => setTimeout(resolve, 500));
-		}
-		return sendResult;
+		});
 	}
 
 	serialize(): MessageEventBusDestinationSyslogOptions {
